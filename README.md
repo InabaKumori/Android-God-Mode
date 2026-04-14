@@ -127,6 +127,7 @@ Upon your next reboot, Magisk will execute the launcher, which instantly drops t
 You can verify the daemon is running silently by typing this into a root terminal:
 ```bash
 ps -ef | grep thermal_daemon
+cat /proc/$(pidof android.hardware.thermal@2.0-service.qti-v2)/stat | awk '{print $3}'     
 ```
 
 Your device is now completely unleashed. The OS services remain awake to satisfy app API checks, but the physical kernel trip-points are permanently neutralized. Enjoy the unlocked framerates!
