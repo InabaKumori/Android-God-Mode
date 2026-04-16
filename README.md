@@ -129,5 +129,159 @@ You can verify the daemon is running silently by typing this into a root termina
 ps -ef | grep thermal_daemon
 cat /proc/$(pidof android.hardware.thermal@2.0-service.qti-v2)/stat | awk '{print $3}'     
 ```
+---
+
+## Phase 6: Hardware Enforcer Scripts (GPU & Memory Bus)
+Even with KonaBess modifying the vendor tables to a single 910 MHz profile ("scorched earth" method), the Android kernel governor and bus monitors will still attempt to idle the system. We use Magisk's late-start service directory (`/data/adb/service.d/`) to brutally force the GPU and memory controllers to stay awake.
+
+Create the following files and ensure they have execution permissions (`chmod 755 /data/adb/service.d/*.sh`).
+
+### 1. The GPU Enforcer (`gpu-lock.sh`)
+This explicitly pins the Adreno 730 to maximum frequency.
+```bash
+#!/system/bin/sh
+
+# Wait for Android to finish booting so the locks stick
+while [ "$(getprop sys.boot_completed)" != "1" ]; do sleep 2; done
+
+# Suppress all standard output and errors
+exec >/dev/null 2>&1
+
+# Explicitly Pin the GPU to 910 MHz
+echo "performance" > /sys/class/kgsl/kgsl-3d0/devfreq/governor
+echo 910000000 > /sys/class/kgsl/kgsl-3d0/devfreq/max_freq
+echo 910000000 > /sys/class/kgsl/kgsl-3d0/devfreq/min_freq
+```
+
+### 2. Memory Bus & Cache Unlocking (`mem-lock.sh`)
+A 3.1 GHz CPU is useless if the memory bus is asleep. This script forces the DDR RAM Bus, L3 Cache, and System Cache (LLCC) to maximum throughput, completely eliminating the "low utilization but low FPS" starvation bottleneck.
+```bash
+#!/system/bin/sh
+
+# Wait for Android to finish booting so our locks don't get overwritten
+while [ "$(getprop sys.boot_completed)" != "1" ]; do sleep 2; done
+
+# Suppress all standard output and errors (Zero Logs)
+exec >/dev/null 2>&1
+
+# 1. Lock the Parent Controllers (DDR, L3, LLCC)
+for bus in DDR L3 LLCC; do
+    if [ -f "/sys/devices/system/cpu/bus_dcvs/$bus/max_freq" ]; then
+        MAX=$(cat /sys/devices/system/cpu/bus_dcvs/$bus/max_freq)
+        echo "$MAX" > "/sys/devices/system/cpu/bus_dcvs/$bus/min_freq"
+    fi
+done
+
+# 2. Lock all the Sub-Nodes (Silver, Prime, Gold, and Bandwidth Monitors)
+for node in /sys/devices/system/cpu/bus_dcvs/*/*; do
+    if [ -d "$node" ] && [ -f "$node/max_freq" ]; then
+        MAX=$(cat "$node/max_freq")
+        echo "$MAX" > "$node/min_freq"
+    fi
+    # Force the governor to performance if it exists
+    if [ -f "$node/governor" ]; then
+        echo "performance" > "$node/governor"
+    fi
+done
+```
+
+---
+
+## Phase 7: ZRAM & Linux VM Tuning (The LZ4 Latency Fix)
+Heavy games like Unreal Engine 4 titles cause modern memory compression (ZSTD) to create a "Latency Trap," where the entire CPU halts (PSI `full` stalls) just to decompress background apps. This script rips out ZSTD, implements lightning-fast LZ4, and re-writes the Linux Virtual Memory (`vm`) rules to stop the kernel from thrashing.
+
+Create `/data/adb/service.d/LZ4_VM_Tuning.sh`:
+```bash
+#!/system/bin/sh
+
+while [ "$(getprop sys.boot_completed)" != "1" ]; do sleep 2; done
+exec >/dev/null 2>&1
+
+# ==========================================
+# 1. OPTIMIZED SWAP & VM TUNING (LZ4)
+# ==========================================
+# Kill existing swap
+swapoff /dev/block/zram0 2>/dev/null
+echo 1 > /sys/block/zram0/reset 2>/dev/null
+
+# Build high-speed LZ4 pipeline
+echo lz4 > /sys/block/zram0/comp_algorithm
+echo 4G > /sys/block/zram0/disksize
+mkswap /dev/block/zram0
+swapon /dev/block/zram0
+
+# Tune Linux Kernel Memory Manager
+sysctl -w vm.swappiness=20
+sysctl -w vm.extra_free_kbytes=153600
+sysctl -w vm.watermark_scale_factor=100
+sysctl -w vm.watermark_boost_factor=0
+```
+Make it executable: `chmod 755 /data/adb/service.d/LZ4_VM_Tuning.sh`
+
+---
+
+## Phase 8: Native SSH Server Integration (Remote Monitoring)
+To monitor kernel logs, PSI, and true hardware clocks from a PC while gaming, we inject a native SSH server. To avoid wasting valuable RAM disk space with temporary mounts, we build a physical shadow directory on `/data` during the `post-fs-data` boot stage and bind-mount it over `/system/usr`.
+
+### Step 1: The Early-Mount Overlay
+Create the setup script in Magisk's early-mount directory. 
+
+Create `/data/adb/post-fs-data.d/ssh-mount.sh`:
+```bash
+#!/system/bin/sh
+# 1. Set SELinux to Permissive to ensure the mount is trusted
+setenforce 0
+
+# 2. Setup the Shadow Mirror on the physical disk (/data partition)
+# This completely avoids taking up permanent RAM space.
+STAGING="/data/adb/usr_shadow"
+
+# Wipe the old shadow on boot so OTA updates to /system/usr don't cause mismatches
+rm -rf "$STAGING"
+mkdir -p "$STAGING"
+
+# 3. Copy original files with metadata preserved (-a)
+cp -a /system/usr/* "$STAGING/"
+
+# 4. Inject SSH folders into the disk copy
+mkdir -p "$STAGING/libexec/ssh-core" "$STAGING/lib"
+cp -af /data/adb/modules/ssh/system/usr/libexec/ssh-core/* "$STAGING/libexec/ssh-core/"
+cp -af /data/adb/modules/ssh/system/usr/lib/* "$STAGING/lib/"
+
+# 5. Apply the correct System Context to everything in the shadow
+chcon -R u:object_r:system_file:s0 "$STAGING"
+
+# 6. Perform the single bind mount from the physical disk to the system
+mount --bind "$STAGING" /system/usr
+```
+Make it executable: `chmod 755 /data/adb/post-fs-data.d/ssh-mount.sh`
+
+### Step 2: The SSH Daemon Launcher
+Create the service to actually start the SSH server once the network is online.
+
+Create `/data/adb/service.d/ssh-start.sh`:
+```bash
+#!/system/bin/sh
+# Wait for boot to finish so network is up
+while [ "$(getprop sys.boot_completed)" != "1" ]; do sleep 2; done
+
+export LD_LIBRARY_PATH=/system/usr/lib:$LD_LIBRARY_PATH
+/system/usr/libexec/ssh-core/sshd \
+  -p 22 \
+  -h /data/adb/ssh/ssh_host_rsa_key \
+  -h /data/adb/ssh/ssh_host_ed25519_key \
+  -o "AuthorizedKeysFile=/data/adb/ssh/root/.ssh/authorized_keys" \
+  -o "PermitRootLogin=yes" \
+  -o "PasswordAuthentication=no" \
+  -o "StrictModes=no"
+```
+Make it executable: `chmod 755 /data/adb/service.d/ssh-start.sh`
+
+---
+
+## Final Verification
+Upon your next reboot, Magisk will execute the early-mount SSH overlay, followed by the complete suite of hardware enforcer scripts. Your Android environment is now a fully prepped, automated, and unthrottled rendering machine.
+
+
 
 Your device is now completely unleashed. The OS services remain awake to satisfy app API checks, but the physical kernel trip-points are permanently neutralized. Enjoy the unlocked framerates!
