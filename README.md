@@ -279,6 +279,31 @@ Make it executable: `chmod 755 /data/adb/service.d/ssh-start.sh`
 
 ---
 
+### The SSH Profile Injector
+
+Run this **just once** from your standard **ADB Shell** (to ensure it captures the perfect Android environment):
+
+```bash
+# 1. Dump the master ADB environment (ignoring transient shell state variables)
+env | grep -vE '^(PWD|SHLVL|_|USER|HOME)=' > /data/adb/master_env.txt
+
+# 2. Forge the native .profile exactly where OpenSSH looks for it
+cat > /data/adb/ssh/root/.profile << 'EOF'
+# Silently inject the perfect ADB environment (TMPDIR, BOOTCLASSPATH, etc.)
+while read -r line; do export "$line"; done < /data/adb/master_env.txt
+
+# Strip the SSH library pollution so Frida and ART don't crash
+unset LD_LIBRARY_PATH
+
+# Add the alias to preserve environments if you ever use 'su'
+alias su='su -m'
+EOF
+
+# 3. Ensure the shell can read it
+chmod 755 /data/adb/ssh/root/.profile
+```
+
+
 ## Final Verification
 Upon your next reboot, Magisk will execute the early-mount SSH overlay, followed by the complete suite of hardware enforcer scripts. Your Android environment is now a fully prepped, automated, and unthrottled rendering machine.
 
