@@ -292,16 +292,58 @@ cat > /data/adb/ssh/root/.profile << 'EOF'
 # Silently inject the perfect ADB environment (TMPDIR, BOOTCLASSPATH, etc.)
 while read -r line; do export "$line"; done < /data/adb/master_env.txt
 
-# Strip the SSH library pollution so Frida and ART don't crash
-unset LD_LIBRARY_PATH
-
-# Add the alias to preserve environments if you ever use 'su'
-alias su='su -m'
 EOF
 
 # 3. Ensure the shell can read it
 chmod 755 /data/adb/ssh/root/.profile
 ```
+
+
+## Phase 9: The Battery Protection Daemon (Deep Discharge Failsafe)
+Because the hardware enforcer scripts in Phase 6 completely eliminate deep sleep, leaving your device unplugged and unattended will cause a rapid "hot drain" down to absolute zero. If a modern Lithium-polymer battery hits this state, the hardware PMIC (Power Management IC) locks the device into a restricted "Trickle Charge" phase for safety, meaning it will charge insanely slowly until it crosses a minimum voltage threshold.
+
+To prevent this, we drop a lightweight, zero-overhead daemon that reads directly from the kernel `sysfs` nodes. It continuously watches for a 10% battery threshold while actively discharging and triggers a safe, graceful OS shutdown before the PMIC hardware locks you out.
+
+Create `/data/adb/service.d/battery_protect.sh`:
+
+```bash
+#!/system/bin/sh
+
+# 1. Wait for Android to finish booting entirely
+while [ "$(getprop sys.boot_completed)" != "1" ]; do sleep 5; done
+
+# Suppress standard output
+exec >/dev/null 2>&1
+
+# 2. Infinite monitoring loop
+while true; do
+    # Read raw kernel values
+    CAPACITY=$(cat /sys/class/power_supply/battery/capacity)
+    STATUS=$(cat /sys/class/power_supply/battery/status)
+
+    # 3. Logic Check: Is it under 10% AND actively draining?
+    if [ "$CAPACITY" -lt 10 ] && [ "$STATUS" = "Discharging" ]; then
+        
+        # Write a warning to the Android logcat just before dying
+        log -p w -t "BatProtect" "Battery critical (${CAPACITY}%). Forcing shutdown to prevent deep discharge."
+        
+        # 4. Execute a graceful system shutdown (safely unmounts f2fs partitions)
+        setprop sys.powerctl shutdown
+        
+        # Exit the script
+        exit 0
+    fi
+
+    # Check every 60 seconds (Sleeps the thread entirely, zero battery drain)
+    sleep 60
+done
+```
+
+Set the execution permissions:
+```bash
+chmod 755 /data/adb/service.d/battery_protect.sh
+```
+
 
 
 ## Final Verification
